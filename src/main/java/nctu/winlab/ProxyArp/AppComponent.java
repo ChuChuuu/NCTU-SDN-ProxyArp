@@ -116,14 +116,7 @@ public class AppComponent implements SomeInterface{
 	@Reference(cardinality = ReferenceCardinality.MANDATORY)
 	protected EdgePortService edgePortService;
 
-    private DHCPRoutingProcessor processor = new DHCPRoutingProcessor();
-
-    @Reference(cardinality = ReferenceCardinality.MANDATORY)
-    protected FlowObjectiveService flowObjectiveService;
-    protected FlowObjectiveService flowObjectiveService2;
-
-
-    private static ConnectPoint deviceConnectPoint = null;
+    private ProxyArpProcessor processor = new ProxyArpProcessor();
 
 	protected Map<Ip4Address,MacAddress> ARPTable = Maps.newConcurrentMap();
 
@@ -132,6 +125,8 @@ public class AppComponent implements SomeInterface{
   	cfgService.registerProperties(getClass());
     appId = coreService.getAppId("nctu.winlab.ProxyArp");
 	packetService.addProcessor(processor,PacketProcessor.director(2));
+	packetService.requestPackets(DefaultTrafficSelector.builder()
+		.matchEthType(Ethernet.TYPE_ARP).build(), PacketPriority.REACTIVE,appId);
     log.info("Started");
   }
   @Deactivate
@@ -142,209 +137,122 @@ public class AppComponent implements SomeInterface{
     log.info("Stopped");
   }
 
-	private class DHCPRoutingProcessor implements PacketProcessor{
+	private class ProxyArpProcessor implements PacketProcessor{
 		@Override
 		public void process(PacketContext context){
 			if(context.isHandled()){
 				return;
 			}
+			if(context.inPacket().parsed().getEtherType() == Ethernet.TYPE_ARP){
+				lookUpTableAndAction(context);
+			}
+		}
+		private void lookUpTableAndAction(PacketContext packetContext){
+			ConnectPoint srcPoint = packetContext.inPacket().receivedFrom();
+			Ethernet ethPkt = packetContext.inPacket().parsed();
+			ARP arpPkt = (ARP)ethPkt.getPayload();
+			MacAddress srcMAC = ethPkt.getSourceMAC();
+			Ip4Address srcIP = Ip4Address.valueOf(arpPkt.getSenderProtocolAddress());
+			Ip4Address tarIP = Ip4Address.valueOf(arpPkt.getTargetProtocolAddress());
+			//put requester information into table
+			ARPTable.put(srcIP,srcMAC);
+			//arp request
+			if(arpPkt.getOpCode() == ARP.OP_REQUEST){
+				if(ARPTable.get(tarIP) == null){
+					log.info("TABLE MISS. Send request to edge ports");
+					floodEdge(ethPkt,srcPoint);
+				}
+				else{
+					MacAddress wantMAC = ARPTable.get(tarIP);
+					String msg = "TABLE HIT. Requested MAC = "+wantMAC.toString();
+					log.info(msg);
+					//packet out
+					Ethernet replyEthPkt = ARP.buildArpReply(tarIP,wantMAC,ethPkt);
+					sendArpReply(packetContext,replyEthPkt);
+				}
+			}
+			else if(arpPkt.getOpCode() == ARP.OP_REPLY){
+				MacAddress wantMAC = srcMAC;
+				MacAddress tarMAC = MacAddress.valueOf(arpPkt.getTargetHardwareAddress());
+				String msg = "RECV REPLY. Request MAC = "+wantMAC.toString();
+				log.info(msg);
+				//find target device
+	//			HostId dstId = HostId.hostId(tarMAC);
+				Host dst = null;// = hostService.getHost(dstId);
+				Set<Host> dst_others = hostService.getHostsByMac(tarMAC);
+				if(!dst_others.isEmpty()){
+					dst = dst_others.iterator().next();
+	//				log.info(dst.toString());
+				}
+				else{
+					log.info("can't find the destination");
+				}
+				targetArpReply(dst,ethPkt);
 
-			lookUpTableAndAction(context);
+
+			}
+//			log.info("end at lookup table");
+		}
+		private void targetArpReply(Host dst,Ethernet reply){
+			if(reply != null){
+//				log.info("in target");
+				TrafficTreatment.Builder builder = DefaultTrafficTreatment.builder();
+				builder.setOutput(dst.location().port());
+				packetService.emit(new DefaultOutboundPacket(dst.location().deviceId(),
+					builder.build(),ByteBuffer.wrap(reply.serialize())));
+			}
+				
+		}
+		private void sendArpReply(PacketContext pkt,Ethernet reply){
+			if(reply != null){
+//				log.info("in send");
+				TrafficTreatment.Builder builder = DefaultTrafficTreatment.builder();
+				ConnectPoint sourcePoint = pkt.inPacket().receivedFrom();
+				builder.setOutput(sourcePoint.port());
+	//			pkt.block();
+				packetService.emit(new DefaultOutboundPacket(sourcePoint.deviceId(),
+					builder.build(),ByteBuffer.wrap(reply.serialize())));
+			}
+		}
+	/*
+		private void PacketOut(PacketContext pktContext,PortNumber port){
+			pktContext.treatmentBuilder().setOutput(port);
+			pktContext.send();
+		}
+		private void floodFunc(PacketContext pktContext){
+			PacketOut(pktContext,PortNumber.FLOOD);
+		}
+	*/
+		private void floodEdge(Ethernet ethPkt,ConnectPoint conPoint){
+//			log.info("in flood edge");
+			if( ethPkt != null){
+				TrafficTreatment.Builder builder = DefaultTrafficTreatment.builder();
+	//			edgePortService.getEdgePoints().forEach(s->log.info(s.toString()));
+				for( ConnectPoint cp : edgePortService.getEdgePoints()){
+					if( cp.equals(conPoint)){
+//						log.info("same {}",cp.toString());
+					}
+					else{
+						packetService.emit(packet(builder,cp,ByteBuffer.wrap(ethPkt.serialize())));
+					}
+				}
+	//			edgePortService.getEdgePoints().forEach(s->packetService.emit(packet(builder,s,ByteBuffer.wrap(ethPkt.serialize()))));
+	//			Optional<TrafficTreatment> builder = Optional.ofNullable(null);
+	//			edgePortService.emitPacket(ByteBuffer.wrap(ethPkt.serialize()),builder);
+			}
+
+		}
+		private DefaultOutboundPacket packet(TrafficTreatment.Builder builder,ConnectPoint point,ByteBuffer data){
+//			log.info("in default");
+			builder.setOutput(point.port());
+			return new DefaultOutboundPacket(point.deviceId(),builder.build(),data);
+
 		}
 
 
 	}
 	
-	private void lookUpTableAndAction(PacketContext packetContext){
-		Ethernet ethPkt = packetContext.inPacket().parsed();
-		ARP arpPkt = (ARP)ethPkt.getPayload();
-		MacAddress srcMAC = ethPkt.getSourceMAC();
-		Ip4Address srcIP = Ip4Address.valueOf(arpPkt.getSenderProtocolAddress());
-		Ip4Address tarIP = Ip4Address.valueOf(arpPkt.getTargetProtocolAddress());
-		//put requester information into table
-		ARPTable.put(srcIP,srcMAC);
-		//arp request
-		if(arpPkt.getOpCode() == 1){
-			if(ARPTable.get(tarIP) == null){
-				log.info("TABLE MISS. Send request to edge ports");
-				floodEdge(ethPkt);
-			}
-			else{
-				MacAddress wantMAC = ARPTable.get(tarIP);
-				String msg = "TABLE HIT. Requested MAC = "+wantMAC.toString();
-				log.info(msg);
-				//packet out
-				Ethernet replyEthPkt = ARP.buildArpReply(tarIP,wantMAC,ethPkt);
-				sendArpReply(packetContext,replyEthPkt);
-			}
-		}
-		//arp reply
-		else if(arpPkt.getOpCode() == 2){
-			MacAddress wantMAC = srcMAC;
-			MacAddress tarMAC = MacAddress.valueOf(arpPkt.getTargetHardwareAddress());
-			String msg = "RECV REPLY. Request MAC = "+wantMAC.toString();
-			log.info(msg);
-			//find target device
-			HostId dstId = HostId.hostId(tarMAC);
-			Host dst = hostService.getHost(dstId);
-			if (dstId == null){
-				log.info("dstId null");
-			}
-			if(dst == null){
-				log.info("dst null");
-			}
-			if( ethPkt == null){
-				log.info("ethpkt null");
-			}
-			targetArpReply(dst,ethPkt);
-
-
-		}
-	}
-	private void targetArpReply(Host dst,Ethernet reply){
-		if(reply != null){
-			TrafficTreatment.Builder builder = DefaultTrafficTreatment.builder();
-			builder.setOutput(dst.location().port());
-			packetService.emit(new DefaultOutboundPacket(dst.location().deviceId(),
-				builder.build(),ByteBuffer.wrap(reply.serialize())));
-		}
-			
-	}
-	private void sendArpReply(PacketContext pkt,Ethernet reply){
-		if(reply != null){
-			TrafficTreatment.Builder builder = DefaultTrafficTreatment.builder();
-			ConnectPoint sourcePoint = pkt.inPacket().receivedFrom();
-			builder.setOutput(sourcePoint.port());
-			pkt.block();
-			packetService.emit(new DefaultOutboundPacket(sourcePoint.deviceId(),
-				builder.build(),ByteBuffer.wrap(reply.serialize())));
-		}
-	}
-	private void PacketOut(PacketContext pktContext,PortNumber port){
-		pktContext.treatmentBuilder().setOutput(port);
-		pktContext.send();
-	}
-	private void floodFunc(PacketContext pktContext){
-		PacketOut(pktContext,PortNumber.FLOOD);
-	}
-	private void floodEdge(Ethernet ethPkt){
-		if( ethPkt != null){
-			TrafficTreatment.Builder builder = DefaultTrafficTreatment.builder();
-			edgePortService.getEdgePoints().forEach(s->log.info(s.toString()));
-
-			edgePortService.getEdgePoints().forEach(s->packetService.emit(packet(builder,s,ByteBuffer.wrap(ethPkt.serialize()))));
-//			Optional<TrafficTreatment> builder = Optional.ofNullable(null);
-//			edgePortService.emitPacket(ByteBuffer.wrap(ethPkt.serialize()),builder);
-		}
-
-	}
-	private DefaultOutboundPacket packet(TrafficTreatment.Builder builder,ConnectPoint point,ByteBuffer data){
-		builder.setOutput(point.port());
-		return new DefaultOutboundPacket(point.deviceId(),builder.build(),data);
-
-	}
-
-
-
-
-	private void findPathAndFlowmod(PacketContext context, InboundPacket pkt, Ethernet ethPkt,Host dst,boolean isBroadcast){
-		log.info("start find path and flowmod");
-		if( isBroadcast == true){
-			log.info("broadcast here");
-			log.info(pkt.receivedFrom().deviceId().toString());
-			log.info(deviceConnectPoint.deviceId().toString());
-			if(pkt.receivedFrom().deviceId().equals(deviceConnectPoint.deviceId())){
-				log.info("destination is on same switch");;
-				installRule(context,deviceConnectPoint.port());
-				return;
-			}
-			log.info("not at same swwwitch");
-		}
-		else{
-			if( pkt.receivedFrom().deviceId().equals(dst.location().deviceId())){
-				log.info("not  broadcast heere");
-				//check although at same device,but  the inport and outport are  distinct
-				if(!context.inPacket().receivedFrom().port().equals(dst.location().port())){
-					log.info("UUnicast message is on same switch");
-					installRule(context,dst.location().port());
-				}
-				return;
-			}
-		}
-
-//find the path to destinationn
-		Set<Path> paths;
-		if(isBroadcast == true){
-			//is brooadcast
-			log.info("is broadcast and try to find pathh");
-			paths  = topologyService.getPaths(topologyService.currentTopology(),
-						pkt.receivedFrom().deviceId(),
-						deviceConnectPoint.deviceId());
-		}
-		else{
-			//is not broadcast
-			log.info("is not broadcast and try to find path");
-			paths  = topologyService.getPaths(topologyService.currentTopology(),
-						pkt.receivedFrom().deviceId(),
-						dst.location().deviceId());
-		
-		}
-
-		//if no path?
-		//pick a ppath
-		log.info("before find  interest");
-		Path intPath=null;//interest path
-		for(Path path:paths){
-			if(!path.src().port().equals(pkt.receivedFrom().port())){
-				intPath = path;
-				log.info("find the Path");
-				break;
-			}
-//			log.info("fid int looop");
-		}
-		log.info("before install rule");
-		installRule(context,intPath.src().port());
-///		log.info("ater insstall  rule");
-	}
-
-	private void installRule(PacketContext context,PortNumber portNumber){
-		//use to create matching field
-		TrafficSelector.Builder  selectorBuilder = DefaultTrafficSelector.builder();
-		InboundPacket pkt = context.inPacket();
-		Ethernet ethPkt  = pkt.parsed();
-
-		if(ethPkt.isBroadcast()){
-			selectorBuilder.matchEthType(Ethernet.TYPE_IPV4)
-				.matchIPProtocol(IPv4.PROTOCOL_UDP)
-				.matchUdpDst(TpPort.tpPort(UDP.DHCP_SERVER_PORT))
-				.matchUdpSrc(TpPort.tpPort(UDP.DHCP_CLIENT_PORT));
-		}
-		else{
-			selectorBuilder.matchEthType(Ethernet.TYPE_IPV4)
-				.matchEthDst(ethPkt.getDestinationMAC())
-				.matchEthSrc(ethPkt.getSourceMAC());
-
-		}
-		//use  to create action
-		TrafficTreatment treatmentBuild = DefaultTrafficTreatment.builder()
-			.setOutput(portNumber).build();
-
-		//to install the flow mod
-		ForwardingObjective forwardingObjective = DefaultForwardingObjective.builder()
-			.withSelector(selectorBuilder.build())
-			.withTreatment(treatmentBuild)
-			.withPriority(50000)
-			.withFlag(ForwardingObjective.Flag.VERSATILE)
-			.fromApp(appId)
-			.makeTemporary(20)
-			.add();
-		flowObjectiveService.forward(pkt.receivedFrom().deviceId(),forwardingObjective);
-		//packetout
-		context.treatmentBuilder().setOutput(portNumber);
-		context.send();
-
-	}
-    @Modified
+	@Modified
 	public void modified(ComponentContext context) {
 	   	Dictionary<?, ?> properties = context != null ? context.getProperties() : new Properties();
 		if (context != null) {
